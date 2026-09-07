@@ -208,7 +208,7 @@ def main():
     pairs = list(valid_pairs_df[["tenant_id", "vehicle_id"]].itertuples(index=False, name=None))
 
     all_rows = []
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS, mp_context=multiprocessing.get_context("fork")) as executor:
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(process_vehicle, t, v): (t, v) for t, v in pairs}
         for future in tqdm(as_completed(futures), total=len(futures)):
             tenant_id, vehicle_id = futures[future]
