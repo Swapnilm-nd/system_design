@@ -115,8 +115,14 @@ def process_vehicle(tenant_id, vehicle_id):
 
         rows = []
         for window_minutes in WINDOW_LENGTHS_MINUTES:
-            window_start = df["timestamp"].dt.floor(f"{window_minutes}min")
-            window_id = ((window_start - _EPOCH) / pd.Timedelta(minutes=window_minutes)).round().astype("int64")
+            # Pure Timedelta arithmetic instead of `.dt.floor(f"{window_minutes}min")` --
+            # frequency-alias strings ("min" vs. "T") aren't consistently accepted across pandas
+            # versions, and this needs to run on whatever old/pinned env happens to be on the
+            # instance. Integer floor-division of two Timedeltas has been stable for a very long
+            # time and sidesteps that entirely.
+            window_length = pd.Timedelta(minutes=window_minutes)
+            window_id = ((df["timestamp"] - _EPOCH) // window_length).astype("int64")
+            window_start = _EPOCH + window_id * window_length
 
             g = df.assign(window_id=window_id, window_start=window_start).groupby(
                 ["window_id", "window_start"], as_index=False
@@ -156,8 +162,19 @@ def process_vehicle(tenant_id, vehicle_id):
         ]
 
 
+OVERALL_COLUMNS = [
+    "window_length_minutes", "window_id", "window_start",
+    "n_online_vehicles", "total_records", "total_storage_bytes",
+]
+
+
 def aggregate_overall(vehicle_window_df):
     ok = vehicle_window_df[vehicle_window_df["error"].isna()]
+    if ok.empty:
+        # Older pandas can drop the group-key columns entirely when grouping an empty frame
+        # (as_index=False doesn't reliably save you) -- return an explicitly-shaped empty frame
+        # instead of letting the caller's sort_values/plotting code KeyError on a missing column.
+        return pd.DataFrame(columns=OVERALL_COLUMNS)
     return (
         ok.groupby(["window_length_minutes", "window_id", "window_start"], as_index=False)
         .agg(
@@ -231,20 +248,31 @@ def main():
     n_error_vehicles = vehicle_window_df.loc[vehicle_window_df["error"].notna(), ["tenant_id", "vehicle_id"]].drop_duplicates().shape[0]
     print(f"vehicles processed = {len(pairs)}, vehicles with errors = {n_error_vehicles}")
 
+    if n_error_vehicles:
+        sample_errors = vehicle_window_df.loc[vehicle_window_df["error"].notna(), "error"].drop_duplicates().head(5)
+        print(f"\nSample distinct error message(s) (up to 5 of {vehicle_window_df['error'].dropna().nunique()} distinct):")
+        for msg in sample_errors:
+            print(f"  - {msg}")
+
+    # Write the raw per-vehicle rows (error strings included) BEFORE any further aggregation --
+    # this is the expensive part (one file read + one embeddings load per vehicle), so a bug in
+    # the aggregation step below must never cost re-running it to get a diagnosable artifact.
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    vehicle_window_path = os.path.join(OUTPUT_DIR, "vehicle_window_online_storage_results.csv")
+    vehicle_window_df.to_csv(vehicle_window_path, index=False)
+    print(f"\nWrote {vehicle_window_path}  ({os.path.getsize(vehicle_window_path):,} bytes)")
+
     overall_df = aggregate_overall(vehicle_window_df)
     summary_df = summarize_by_window_length(vehicle_window_df, overall_df)
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    vehicle_window_path = os.path.join(OUTPUT_DIR, "vehicle_window_online_storage_results.csv")
     overall_path = os.path.join(OUTPUT_DIR, "overall_window_online_storage_results.csv")
     summary_path = os.path.join(OUTPUT_DIR, "online_storage_summary_by_window_length.csv")
 
-    vehicle_window_df.to_csv(vehicle_window_path, index=False)
     overall_df.to_csv(overall_path, index=False)
     summary_df.to_csv(summary_path, index=False)
 
-    print("\nWrote outputs:")
-    for p in (vehicle_window_path, overall_path, summary_path):
+    print("Wrote outputs:")
+    for p in (overall_path, summary_path):
         print(f"  {p}  ({os.path.getsize(p):,} bytes)")
 
     print("\nSummary by window length:")
