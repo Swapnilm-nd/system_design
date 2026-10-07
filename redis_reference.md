@@ -242,3 +242,121 @@ independent, unsynchronized Redis clusters — each cluster's `SET NX` could suc
 differently, so the two backends could disagree about who currently holds a given vehicle's
 lock. Harmless under the current Valkey-only config; flagged for whoever changes those flags
 during a future cache migration.
+
+---
+
+# Redis command reference — sliding-window split-merge design (current)
+
+Every Redis data type and command referenced by
+[`dis_sliding_window_split_merge_design.md`](dis_sliding_window_split_merge_design.md), the
+current, actively-developed DIS design (a different, newer architecture from the vehicle-window
+design documented above — session-based buffer + matrix resolution, not a single per-vehicle
+window ZSET). Organized by the six Redis structures that design defines (§2), plus the scripting
+primitive that ties several of them together atomically.
+
+## Data types used
+
+| Type | Structure(s) | Why this type |
+|---|---|---|
+| **String** | `dis_device_lock` (§2.5) | Simplest possible shape for a lock — one key, one value (the holder's token), one expiry. |
+| **Hash** | `dis_saved_sessions` (§2.2), `dis_session_meta` (§2.3) | Field-value pairs under one key per device — natural fit for "many sessions, each with their own data, sharing one device-scoped key." |
+| **Set** | `dis_active_devices` (§2.4) | Unordered collection of unique members (`{tenant_id}:{device_id}` strings) — membership only, no ordering or scoring needed. |
+| **Sorted Set (ZSET)** | `dis_session_by_end` (§2.6) | Needs members kept in score order (`end_dct`) at all times, for the backward walk (§4.3) to traverse without re-sorting on every call. |
+| **Sorted Set (ZSET)** | `dis_embed_list` (§2.1) | Pinned as a ZSET (score = dct, member = serialized `(session_id, embedding)`) rather than Redis's native `LIST` type, which has no built-in sorted-insert — same reasoning the vehicle-window design above already worked through for its own analogous buffer ("Why a Sorted Set, not a List"). Gives sorted insertion, cheap pop-the-oldest (`ZPOPMIN`), and cheap neighbor (`prev`/`next`) lookups for free, all of which §4.2's matrix needs on every insert. One consequence: since `session_id` lives inside the member string, relabeling an entry (merges, splits) is a `ZREM`+`ZADD` pair, not an in-place field update. |
+
+## Hash commands (`dis_saved_sessions`, `dis_session_meta`)
+
+- **`HGET key field`** — read one field's value. Used to read one session's saved dct list
+  (`dis_saved_sessions`) or one compound metadata field (`dis_session_meta`) before modifying it.
+- **`HSET key field value`** — write one field's value. The write half of every read-modify-write
+  on these hashes (append a dct, update `start_dct`/`end_dct`, etc.).
+- **`HGETALL key`** — return every field *and* value in the hash in one round trip. §2.2 calls
+  this out explicitly for the historical path's original "fetch every saved session" access
+  pattern — since superseded for candidate search by the `dis_session_by_end` index (§2.6), but
+  still the natural op for anything that genuinely needs every saved session's full data at once.
+- **`HKEYS key`** — return just the field *names* (i.e. the session_ids), no values. Cheaper than
+  `HGETALL` when only the set of ids is needed, not their data.
+- **`HMGET key field1 field2 ...`** — read several *specific* fields in one call, without fetching
+  the whole hash. This is exactly how `dis_session_meta`'s compound-field design (§2.3) reads one
+  session's full metadata: `HMGET` its six `{session_id}:*` field names at once, rather than one
+  `HGET` per field.
+- **`HINCRBY key field increment`** — atomically add an integer to a field's current value, no
+  read-modify-write needed. This is specifically why `dis_session_meta` uses compound fields
+  instead of one JSON blob per session (§2.3) — `member_count` needs this atomic increment on
+  every pop-type event, which a JSON blob can't support natively.
+- **`HDEL key field`** — remove one field from the hash. Used at session evacuation (§5.2 step 6)
+  to delete a finalized session's saved-dct-list and metadata fields.
+
+## Set commands (`dis_active_devices`)
+
+- **`SADD key member`** — add a member to the set (a no-op if already present). Adds a device on
+  its first-ever live-path insert (§2.4).
+- **`SREM key member`** — remove a member. Removes a device once it has no live entries and no
+  saved sessions left (§2.4, §5.2 step 6).
+- **`SMEMBERS key`** (or `SSCAN` for a very large set, incremental/cursor-based rather than one
+  blocking call) — enumerate every member. What `sessions_eviction` iterates each cycle instead
+  of a full keyspace `SCAN` across the whole Redis instance.
+
+## Sorted Set commands (`dis_session_by_end`, `dis_embed_list`)
+
+- **`ZADD key score member`** — add a member with a score, or update its score if the member
+  already exists. Adds/updates a session's entry in `dis_session_by_end` whenever its `end_dct`
+  changes (§2.6); also the insert op for `dis_embed_list` (§2.1) — every new image, and every
+  `ZREM`+`ZADD` re-insert when relabeling an entry during a merge or split.
+- **`ZREM key member`** — remove a member regardless of its score. Removes a merged-away or
+  evacuated session's entry from the index; also the first half of relabeling a `dis_embed_list`
+  entry (§2.1), since `session_id` lives inside the member string rather than a separate field.
+- **`ZRANGEBYSCORE key min max`** — return members whose score falls in `[min, max]`, ascending
+  order; Redis syntax `(value` makes a bound exclusive (matching this design's `gap < threshold`
+  convention throughout — see §1). The general range-query primitive behind any "what falls in
+  this dct window" check.
+- **`ZREVRANGEBYSCORE key max min`** — the same range query, but returned in *descending* score
+  order. This is specifically what §4.3's backward walk uses to traverse a device's saved sessions
+  from most-recent to oldest.
+- **`ZRANGE key rank1 rank2`** (or `ZRANGEBYSCORE` around a given member) — used against
+  `dis_embed_list` (§2.1) to read a newly-inserted entry's immediate `prev`/`next` neighbors by
+  their rank, exactly what the 8-case matrix (§4.2) compares against.
+- **`ZPOPMIN key`** — atomically remove and return the lowest-scored member of `dis_embed_list`
+  (§2.1) — exactly "pop the front/oldest entry to hold the list at size `N`" (§4.2 step 1) in one
+  call.
+
+## String / lock commands (`dis_device_lock`)
+
+- **`SET key value NX PX <ms>`** — one atomic command combining three things: set the key's value,
+  **only if it does not already exist** (`NX` — this is what makes it work as a mutual-exclusion
+  primitive: only one caller's `SET ... NX` can ever succeed for a given key at a time), and
+  **auto-expire it after `<ms>` milliseconds** (`PX` — the safety net against a crashed holder;
+  `EX` is the same idea in whole seconds rather than milliseconds). This is the lock's acquire
+  step (§2.5, §7.3).
+- **`GET key`** — read a string's current value. Used in the lock's release script to check
+  whether the key still holds *this caller's* token before deleting it.
+- **`DEL key`** — delete a key outright. Never called unconditionally on the lock (that would risk
+  deleting a different caller's lock, see §2.5) — only ever reached via the token-compare-then-`DEL`
+  Lua script below.
+
+## Scripting
+
+- **`EVAL script numkeys key... arg...`** (Lua) — runs a script server-side as one atomic,
+  uninterruptible step; nothing else can execute on that Redis instance between the script's
+  individual commands. Two places in this design specifically need that atomicity:
+  - **Lock release** (§2.5, §7.3): `GET` the lock key, compare its value to the caller's token,
+    `DEL` only on a match. If this were two separate round trips (`GET` then `DEL`), another
+    process could acquire the lock in the gap between them, and the blind `DEL` would delete that
+    new holder's lock instead of a no-op.
+  - **`insert_and_resolve_session`** (§7.3): the entire routing/insert/pop/8-case-matrix sequence
+    (§4.1–§4.2) runs as one script or Lua-orchestrated sequence, so that a pop, a matrix
+    resolution, a merge's saved-data reconciliation, and every metadata/index update they trigger
+    all land as one indivisible unit — no other worker's operation on that device can interleave
+    partway through, which is also why the per-device lock (§6) is acquired *before* this runs and
+    held across the whole sequence rather than relying on `EVAL`'s atomicity alone (`EVAL`
+    guarantees no interleaving *within* the script, not exclusivity *across* separate calls).
+
+## Not used in this design (called out for the same reasons the vehicle-window design above rejected them)
+
+- **`KEYS pattern`** — blocks the whole Redis server while it walks every key; never appropriate
+  against a live instance. `dis_active_devices` (§2.4) exists specifically so nothing in this
+  design needs `SCAN` (the safe, incremental alternative) or `KEYS` at all for device enumeration.
+- **Redis Streams (`XADD`/`XRANGE`)** — require each new entry's ID to be strictly greater than
+  the previous one, which doesn't tolerate the out-of-order arrivals this design explicitly
+  accommodates (§2.1's sorted insertion, §4.1's mixed-request handling) — same reasoning the
+  vehicle-window design above already worked through.

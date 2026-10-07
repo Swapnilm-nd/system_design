@@ -43,13 +43,28 @@ All keys are scoped `{tenant_id}:{device_id}` unless noted.
 
 ### 2.1 Embedding list — `dis_embed_list:{tenant_id}:{device_id}`
 
-A list, sorted by `device_capture_time` (dct), **bounded to `N` entries** (§3). Each entry is a
-triple: **`(session_id, embedding, dct)`**.
+A Redis **Sorted Set (ZSET)**, scored by `device_capture_time` (dct), **bounded to `N` entries**
+(§3). Each member is a serialized `(session_id, embedding)` pair. A native Redis `LIST` was
+considered and rejected — Lists have no built-in sorted insert, so every insert would need its own
+read-scan-reinsert to find the correct position; a ZSET gives sorted insertion, cheap pop-the-
+oldest, and cheap neighbor (`prev`/`next`) lookups natively, all of which §4.2's matrix needs on
+every single insert.
 
-- `dct` — the sort key, and the input to the dct-gap-threshold check against neighbors.
-- `embedding` — the input to the similarity check against neighbors.
-- `session_id` — the currently-assigned session tag for this image. This is what the live-path
-  matrix (§4.2) reads and, in some cases, relabels for other entries too.
+- `dct` (the score) — the sort key, and the input to the dct-gap-threshold check against
+  neighbors. `ZADD` inserts a new entry at its correct sorted position in one call; `ZRANGE`
+  around a given member's rank reads its immediate `prev`/`next` neighbors; `ZPOPMIN` atomically
+  removes and returns the lowest-scored (oldest) entry — exactly "pop the front entry to hold the
+  list at size `N`" (§4.2 step 1) in one call.
+- `embedding` — the input to the similarity check against neighbors, packed into the member string
+  alongside `session_id` (e.g. a small JSON or binary encoding of both).
+- `session_id` — the currently-assigned session tag for this image, part of the same member
+  string as `embedding`. This is what the live-path matrix (§4.2) reads and, in some cases,
+  relabels for other entries too — since `session_id` lives inside the member string rather than
+  a separate field, **relabeling an entry means `ZREM` the old member and `ZADD` a new one at the
+  same score** with the updated `session_id` baked in, not an in-place field update. This is the
+  concrete cost of every merge (§4.2 case 2, relabeling every `next`-tagged live entry) and every
+  split (cases 3/5/7, relabeling everything peeled off) — one `ZREM`+`ZADD` pair per relabeled
+  entry, `O(log N)` each.
 
 `tenant_id`/`device_id` are not stored per-entry (implicit from the key). `image_id` is not
 stored either — finalization (§5) queries the source-of-truth DB by dct range, not by per-image
@@ -123,8 +138,8 @@ six compound field names. `tenant_id`/`device_id` are not stored here either, sa
   writes land directly in the saved list. A live-path assignment to an existing session never
   touches it, for the same reason it never touches `start_dct`/`end_dct` — that member hasn't
   reached the saved list yet. A merge (§4.2 case 2) sums the surviving and abandoned ids'
-  `member_count`s; a "breaking" truncation (§4.3.2 item 1) subtracts the moved count from the old
-  session and sets it as the new back-half session's initial count.
+  `member_count`s; a "breaking" split (§4.3.2) apportions the original count across however many
+  session-sourced groups the merge walk (§4.3.1) produces, each keeping its own group's size.
 
 ### 2.4 Device enumeration set — `dis_active_devices`
 
@@ -312,8 +327,8 @@ Per image, in order:
 - **The live path can split an already-established session on its own** (cases 3/5/7) — unlike a
   merge, a split never touches pre-existing saved data, since whichever portion keeps the old id
   keeps its saved history untouched, and the newly-split-off portion has none yet. This is in
-  addition to, not instead of, the historical/saved "breaking" check in §4.3.2 item 1, which
-  covers the case where a session has no live representation left at all.
+  addition to, not instead of, the historical/saved "breaking" resolution in §4.3.2, which covers
+  the case where a session has no live representation left at all.
 
 ### 4.3 Historical/backward-walk path
 
@@ -329,86 +344,100 @@ number of saved sessions in one pass, holding the per-device lock for correspond
 blocking other work on that device — live inserts, `sessions_eviction` — for the duration. This is
 a real latency cost, not a correctness problem (everything stays safely serialized), and is
 accepted rather than capped; revisit if it becomes an operational issue (e.g. a max-sessions-per-
-pass limit, continuing the walk on a subsequent call).
+pass limit, continuing the walk on a subsequent call). This cost is higher than it might first
+appear: the merge below reads each touched session's *entire* saved dct list (§2.2), not just its
+cached range summary, so the walk's cost scales with the total number of saved members across every
+session it touches, not just the count of sessions.
 
-**4.3.1 Backward two-pointer walk.** Group H's images are already sorted in decreasing dct order
-(§4.1). Walk the device's saved sessions in the same direction — most recent first — via
-`ZREVRANGEBYSCORE dis_session_by_end` (§2.6). Because both sequences move in the same direction,
-this is a single merge-style pass with one shared cursor into Group H, never rewinding:
+**4.3.1 Backward merge walk.** Two sequences, both traversed in strictly decreasing dct order:
+Group H's own images (already sorted descending, §4.1), and the device's saved sessions, visited
+one at a time in descending order via `ZREVRANGEBYSCORE dis_session_by_end` (§2.6) — within
+whichever session is currently being visited, its own full dct list (§2.2) is read and consumed in
+descending order too.
 
-- For the current session `S_i` in the walk, consume images off the front of the remaining Group H
-  list for as long as they fall in one of two places, classifying each contiguous run into a
-  **bucket**:
-  - **Interior of `S_i`** — the image's dct falls within `[S_i.start_dct, S_i.end_dct]` → this
-    bucket resolves via **breaking** (§4.3.2).
-  - **The gap between `S_i` and the next-older session `S_{i-1}`** — the image's dct falls between
-    `S_{i-1}.end_dct` and `S_i.start_dct` → this bucket resolves via **extension / bridging /
-    no-match** (§4.3.2), with `S_i` and `S_{i-1}` as the only two possible candidates — nothing else
-    could be closer, since they're the immediately adjacent sessions bounding this exact gap by
-    construction of the walk. No separate exhaustive candidate search is needed here; the walk
-    already knows both boundary sessions for every gap it produces.
-  - The **leading edge** (between the newest saved session and `start_dct` itself) and the
-    **trailing edge** (before the oldest saved session) are the same gap logic with one side open —
-    only forward-extension against the newest session is possible on the leading edge, only
-    backward-extension against the oldest session on the trailing edge; neither can bridge, since
-    there's nothing on the open side to bridge to.
-- Once nothing remains in Group H for `S_i`'s territory or the gap after it, advance to `S_{i-1}`
-  and repeat. Images already consumed and assigned to a bucket are never re-examined.
-- This makes the whole Group H pass `O(|Group H| + K)`, `K` = saved sessions walked — each image
-  and each session boundary visited once, not cross-checked against everything (the `O(K)` full
-  scan §2.6 exists to avoid).
+At each step, compare the largest remaining element from each sequence and consume the larger one.
+**On an exact tie, the session-sourced element is always consumed first** — an arriving image is
+treated as *not* greater than an existing confirmed member at the same dct, deferring to it rather
+than triggering a group switch on its own. Group consecutive same-source picks together; a new
+group starts every time the source switches. When the current session's own list is exhausted,
+advance to the next-older session (via the index) and continue; when Group H is exhausted, stop —
+any remaining session-sourced elements simply become the final group(s), and (since sessions never
+overlap, §4.4) the next-older session's `end_dct` should already be below whatever's left, a
+consistency check rather than something the ordinary path needs to act on.
 
-**4.3.2 Per-bucket resolution:**
+This directly discovers every position where an existing session's own continuity is actually
+interrupted, rather than inferring it from the arriving images' mutual continuity with *each
+other*. That distinction matters concretely: two arriving images can be close to each other in time
+and still need two independent resolutions, if a confirmed existing member sits between them.
+Worked example: `Sn = [10:00, 10:08, 10:16, 10:24]` (every adjacent gap a legitimate 8 minutes), a
+historical batch arrives with `[10:04, 10:20]` (only 16 minutes apart from each other, but each
+lands in a *different* gap of `Sn`). Merging `Sn`'s descending list `[10:24, 10:16, 10:08, 10:00]`
+against the arriving descending list `[10:20, 10:04]`:
 
-1. **Interior bucket → breaking.** The bucket's dct(s) land strictly between two dct values that
-   are *both* already-confirmed members of `S_i` (an interior sandwich). This always triggers a
-   three-way split, regardless of how many images are in the bucket.
+`10:24`(session) → `10:20`(**arrival**, switch) → `10:16`(session, switch) → `10:08`(session, same)
+→ `10:04`(**arrival**, switch) → `10:00`(session, switch, arrivals now exhausted)
 
-   Worked example: `S1 = [10:00, 10:01, 10:15, 10:30, 10:50, 10:55, 10:56]`. A bucket contains
-   `[10:41, 10:45, 10:49]` — falls between `S1`'s `10:30` and `10:50`:
-   - `S1` truncates to `[10:00, 10:01, 10:15, 10:30]` (everything before the gap, same old id) —
-     its `dis_session_meta` entry has `end_dct` rewritten down to `10:30`, `member_count` reduced
-     by the 3 members moved to the back half, and `last_updated_at` bumped to now (the truncation
-     is itself a material change to this session's identity); its entry in `dis_session_by_end`
-     (§2.6) is updated to match.
-   - a new session takes the back half: `[10:50, 10:55, 10:56]` (new id) — fresh `dis_session_meta`
-     created, `start_dct = 10:50`, `end_dct = 10:56`, `member_count = 3`,
-     `created_at = last_updated_at = now`, with a fresh entry in the range index.
-   - the bucket becomes its own new session: `[10:41, 10:45, 10:49]` (another new id) — fresh
-     `dis_session_meta` and range-index entry created the same way, `member_count = 3`.
+Five groups: `[10:24]`, `[10:20]`, `[10:16, 10:08]`, `[10:04]`, `[10:00]` — two independent
+interruptions correctly discovered as separate, not collapsed into one.
 
-   This check is purely positional — saved sessions generally don't retain embeddings for interior
-   (non-latest) members, so no similarity comparison is possible or needed. The mere presence of
-   dct's landing precisely inside an assumed-continuous gap is treated as sufficient proof the gap
-   wasn't actually continuous.
-2. **Gap bucket — internal split first, then extension / bridging / no-match.** A gap bucket can
-   itself contain images that aren't mutually continuous (e.g. two genuinely separate delayed
-   clusters that happen to both fall in the same inter-session gap without being close enough to
-   *each other*) — the boundary walk only tells you which two sessions bound the bucket, not
-   whether the bucket's own contents are one coherent group. So first, apply the same
-   similarity/dct-gap rule used everywhere else, just within this one bucket, to split it into
-   sub-groups if needed. This applies uniformly regardless of bucket size — a single-image bucket
-   and a five-image bucket follow the exact same rule.
+**4.3.2 Resolving each resulting group:**
 
-   For each resulting sub-group, resolve against its bucket's two bounding sessions:
-   - **Close to `S_i`'s `start_dct` only** (backward extension) or **close to `S_{i-1}`'s `end_dct`
-     only** (forward extension) → attach directly: append the sub-group's dct(s) to that session's
-     saved list, extend `start_dct`/`end_dct` and `member_count` accordingly (§2.3), bump
-     `last_updated_at` to now (an assignment event, same convention as §4.2 — never backdated to the
-     sub-group's own dct; see §5.1 for why), and update that session's entry in the range index.
-   - **Close to both** → **bridging**: do not merge, do not guess. The sub-group becomes its own new
-     session regardless of which side it's closer to — `dis_session_meta` created fresh (`start_dct
-     = min`, `end_dct = max` of the sub-group's own dct's, `member_count` = its own image count,
-     `created_at = last_updated_at = now`), with a fresh entry in the range index. On the leading or
-     trailing edge, where only one bounding session exists, bridging is impossible by construction —
-     there's nothing on the open side to be close to.
-   - **Close to neither** → **no match**: the sub-group becomes one brand-new saved session
-     outright, `dis_session_meta` and range-index entry created the same way as bridging above.
+- **Session-sourced groups** — pieces of an existing session's own confirmed data, produced
+  whenever that session's continuity survives one or more stretches uninterrupted by an arrival.
+  Across the *whole* walk, the single **oldest** (last-consumed, chronologically earliest)
+  session-sourced group keeps that session's original id — its `dis_session_meta` entry has
+  `end_dct` rewritten down to this group's own latest dct, `member_count` reduced to this group's
+  own size, `last_updated_at` bumped to now (a material change to this session's identity), and its
+  `dis_session_by_end` entry updated to match. **Every other** session-sourced group — anything
+  isolated between two interruptions, or the newest remaining piece before the first one — gets a
+  fresh `dis_session_meta` record and range-index entry the same as any other new-session creation
+  (`start_dct`/`end_dct` = this group's own min/max, `member_count` = this group's own size,
+  `created_at = last_updated_at = now`).
+- **Arrival-sourced groups** — resolved by what brackets them in the merge sequence, which the walk
+  already knows without any further search:
+  - **Bracketed by session-sourced groups belonging to the *same* original session on both sides**
+    → **interior** → **breaking**, unconditionally, treating the whole group as one unit: this
+    group becomes its own new session, no further check needed. Session data on both sides is what
+    makes this safe without a mutual-continuity check — anything genuinely disconnected within an
+    interior group would already have been separated by session-sourced elements sitting between
+    it, per the merge itself (§4.3.1's worked example). Purely positional otherwise — saved
+    sessions generally don't retain embeddings for interior (non-latest) members, so no similarity
+    comparison is possible or needed. The mere presence of dct's landing precisely inside an
+    assumed-continuous gap is treated as sufficient proof the gap wasn't actually continuous.
+  - **Bracketed by session-sourced groups belonging to *two different* sessions, or on only one
+    side** (the **gap** between two sessions where one's list was just exhausted and the
+    next-older one is starting; or the **leading edge**, before `start_dct` itself; or the
+    **trailing edge**, past the oldest saved session) → **run a mutual-continuity internal-split
+    first, same similarity/dct-gap rule used everywhere else, then resolve each resulting
+    sub-group independently.** Unlike the interior case, nothing session-sourced separates
+    arrival elements that both happen to fall in open space between two sessions (or past an open
+    edge) — the merge only ever switches groups when a *session*-sourced element interrupts an
+    arrival run, so several mutually-unrelated arrivals can end up merged into one group here
+    purely because nothing existed to interrupt them, even if they're far apart from each other
+    and from both bracketing sessions. Concrete example: `Sn = [10:00]`, next-older
+    `S_{i-1} = [08:00]`, an arriving batch of `[09:52, 09:20, 08:05]` — all three get consumed
+    consecutively by the walk (nothing session-sourced falls between them), but `09:52` is a
+    genuine backward-extension candidate for `Sn`, `08:05` a genuine forward-extension candidate
+    for `S_{i-1}`, and `09:20` is close to neither — resolving them as one aggregate group would
+    silently drag all three into whichever side the *group's* overall range happened to favor.
+    Splitting first by mutual continuity separates them correctly before resolution runs.
+
+    For each resulting sub-group: close to the newer session's `start_dct` only (backward
+    extension) or the older session's `end_dct` only (forward extension) → attach directly,
+    extending `start_dct`/`end_dct`/`member_count` (§2.3) and bumping `last_updated_at` on that
+    session, and updating its range-index entry; close to **both** → **bridging** — do not merge,
+    do not guess, the sub-group becomes its own new session regardless of which side it's closer
+    to, with fresh `dis_session_meta` and range-index entries; close to **neither** → **no match**
+    — the sub-group becomes one brand-new saved session outright, same metadata treatment as
+    bridging. On the leading or trailing edge, where only one bounding session exists, bridging is
+    impossible by construction — there's nothing on the open side to be close to, so only one
+    direction of extension (or no-match) applies.
 
 ### 4.4 Why finalization can safely use a session's own tight dct range
 
-Because both the live-path split (§4.2, cases 3/5/7) and the historical "breaking" split (§4.3.2
-item 1) always narrow a session's own range to exclude whatever caused the split — the live-path
+Because both the live-path split (§4.2, cases 3/5/7) and the historical "breaking" split (§4.3.2,
+resolved via the backward merge walk of §4.3.1) always narrow a session's own range to exclude
+whatever caused the split — the live-path
 version by re-tagging live entries before any of them ever reach the saved store, the historical
 version by directly narrowing already-saved data — and because merges now reconcile saved data
 instead of orphaning it (§4.2, §6), a session's own `[start_dct, end_dct]` (§2.3) is guaranteed to
@@ -593,8 +622,10 @@ tenant, it applies to every device under that tenant — no separate per-device 
 
 After existing per-image prediction, for any device whose tenant has
 `tenant.config["DIS_WINDOW"]["enabled"]` set: build the per-image record (existing fields +
-embedding + raw `predicted_driver_id`) and run the full insert/resolve step (§4.1-§4.2) against
-that device's embedding list. This must be:
+embedding + raw `predicted_driver_id`) and run the full routing/resolve step (§4.1) against that
+device's embedding list — which, per §4.1's Group L/Group H split, may invoke *both* the live-path
+matrix (§4.2) and the historical backward-walk (§4.3) for a single incoming request, not §4.2
+alone. This must be:
 
 - **Best-effort and non-fatal** — a failure here logs and continues; it must never block or fail
   the service's existing synchronous response path.
@@ -608,7 +639,7 @@ that device's embedding list. This must be:
   merge-time saved-data reconciliation and session-metadata updates) as one Lua script or
   Lua-orchestrated sequence for atomicity, release the lock.
 - `resolve_historical_group(tenant_id, device_id, group_records)` — implements §4.3's backward
-  two-pointer walk for Group H, under the same per-device lock for its full read-decide-write
+  merge walk for Group H, under the same per-device lock for its full read-decide-write
   sequence, however many sessions the walk ends up touching.
 - `pop_and_save(tenant_id, device_id, popped_entry)` — the unconditional pop-push described in
   §4.2, including the `start_dct`/`end_dct`/`member_count` update in `dis_session_meta` (never
@@ -618,7 +649,7 @@ that device's embedding list. This must be:
   `sessions_eviction`.
 - `finalize_and_evacuate_session(tenant_id, device_id, session_id)` — used by `sessions_eviction`'s
   Phase 2 (§5.2): read the session's saved dct range and `member_count`, delete its
-  `dis_saved_sessions`/`dis_session_meta` fields and its entries in both range indexes (§2.6) after
+  `dis_saved_sessions`/`dis_session_meta` fields and its entry in the range index (§2.6) after
   persistence succeeds, and remove the device from `dis_active_devices` if it's now fully empty.
 - `acquire_device_lock(tenant_id, device_id)` / `release_device_lock(tenant_id, device_id, token)`
   — **not** registered in the dual-write Router (see §6 for why); each targets a single backend,
