@@ -171,9 +171,15 @@ def process_device_file(path):
         position_in_run = df.groupby(run_id).cumcount()
         sub_run = position_in_run // GROUP_SIZE_MAX
 
-        arrivals = df.groupby([run_id, sub_run]).agg(
-            n_images_in_request=("timestamp", "size"),
-            request_ts=("timestamp", "max"),
+        # Plain single-column SeriesGroupBy.agg(name=func) rather than the
+        # DataFrameGroupBy NamedAgg tuple form (agg(name=(col, func))) - the
+        # tuple form only exists from pandas 0.25 onward and silently
+        # misbehaves (drops as_index handling) on the older pandas shipped
+        # in this repo's production conda env. See the two-key groupby
+        # below in main() for where that actually bit us.
+        arrivals = df.groupby([run_id, sub_run])["timestamp"].agg(
+            n_images_in_request="size",
+            request_ts="max",
         ).reset_index(drop=True)
 
         assert arrivals["n_images_in_request"].sum() == len(df)
@@ -186,8 +192,8 @@ def process_device_file(path):
             bucket_start = arrivals["request_ts"].dt.floor(freq)
             g = (
                 arrivals.assign(bucket_start=bucket_start)
-                .groupby("bucket_start")
-                .agg(n_requests=("n_images_in_request", "size"), n_images=("n_images_in_request", "sum"))
+                .groupby("bucket_start")["n_images_in_request"]
+                .agg(n_requests="size", n_images="sum")
                 .reset_index()
             )
             for _, row in g.iterrows():
@@ -316,25 +322,20 @@ def main():
     # carry device identity (aggregated fleet-wide below) - kept lightweight
     # on purpose; see per_device_summary.csv for the per-device view.
 
-    # Diagnostic instrumentation (temporary - remove once the "granularity"
-    # KeyError on this environment's pandas build is understood): the earlier
-    # "is bucket_rows_all empty" guard above did NOT fire, meaning this list
-    # is non-empty, yet the groupby/sort_values below has still failed to
-    # find a "granularity" column on this exact pandas/Python 3.6 build -
-    # print exactly what got constructed instead of guessing further.
-    print(f"\n[diag] bucket_rows_all length: {len(bucket_rows_all):,}")
-    print(f"[diag] bucket_rows_all[0]: {bucket_rows_all[0]!r}")
-    print(f"[diag] bucket_df.shape: {bucket_df.shape}")
-    print(f"[diag] bucket_df.columns: {bucket_df.columns.tolist()}")
-    print(f"[diag] bucket_df.dtypes:\n{bucket_df.dtypes}")
-    if not bucket_df.empty:
-        print(f"[diag] bucket_df.head(3):\n{bucket_df.head(3).to_string()}")
-
     # ---- 3. Fleet-wide (overall) per-bucket request/image counts - the
     # primary "frequency of incoming requests" output ----
+    # Plain dict-style .agg({col: func}) with no renaming needed (source and
+    # target column names already match) - the two-key DataFrameGroupBy +
+    # as_index=False + NamedAgg-tuple form (agg(name=(col, func))) requires
+    # pandas >= 0.25 and silently drops "granularity"/"bucket_start" to
+    # index levels instead of columns on older pandas (reproduced on this
+    # repo's production conda env, frsEnvPython3 / Python 3.6), causing the
+    # KeyError in sort_values below. An explicit .reset_index() avoids
+    # relying on as_index at all.
     overall_bucket_df = (
-        bucket_df.groupby(["granularity", "bucket_start"], as_index=False)
-        .agg(n_requests=("n_requests", "sum"), n_images=("n_images", "sum"))
+        bucket_df.groupby(["granularity", "bucket_start"])
+        .agg({"n_requests": "sum", "n_images": "sum"})
+        .reset_index()
         .sort_values(["granularity", "bucket_start"])
         .reset_index(drop=True)
     )
