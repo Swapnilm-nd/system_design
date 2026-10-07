@@ -135,6 +135,12 @@ def process_device_file(path):
     """
     try:
         df = pd.read_csv(path, usecols=["timestamp", "tenant_id", "device_id", "dis"])
+        n_images_raw = len(df)
+        # Keep a few RAW (unparsed) timestamp strings around before overwriting
+        # the column - if every single one fails to parse (format mismatch on
+        # this environment/dataset), this is what actually shows the real
+        # format on the instance instead of a silent, opaque "0 rows survived".
+        raw_timestamp_sample = df["timestamp"].head(3).tolist() if n_images_raw else []
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
         dropped_missing_timestamp = int(df["timestamp"].isna().sum())
         df = df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
@@ -148,6 +154,8 @@ def process_device_file(path):
                 "path": path, "tenant_id": None, "device_id": None,
                 "n_images": 0, "n_requests": 0, "bucket_rows": [],
                 "batch_size_counts": {}, "device_summary": None,
+                "n_images_raw": n_images_raw,
+                "raw_timestamp_sample": raw_timestamp_sample if dropped_missing_timestamp == n_images_raw else [],
                 "dropped_missing_timestamp": dropped_missing_timestamp, "error": None,
             }
 
@@ -208,6 +216,7 @@ def process_device_file(path):
             "n_images": len(df), "n_requests": len(arrivals),
             "bucket_rows": bucket_rows, "batch_size_counts": batch_size_counts,
             "device_summary": device_summary,
+            "n_images_raw": n_images_raw, "raw_timestamp_sample": [],
             "dropped_missing_timestamp": dropped_missing_timestamp, "error": None,
         }
     except Exception as e:
@@ -215,6 +224,7 @@ def process_device_file(path):
             "path": path, "tenant_id": None, "device_id": None,
             "n_images": 0, "n_requests": 0, "bucket_rows": [],
             "batch_size_counts": {}, "device_summary": None,
+            "n_images_raw": 0, "raw_timestamp_sample": [],
             "dropped_missing_timestamp": None, "error": str(e),
         }
 
@@ -229,6 +239,9 @@ def main():
     bucket_rows_all = []
     batch_size_counts_total = {}
     errors = []
+    total_images_raw = 0
+    total_dropped_missing_timestamp = 0
+    raw_timestamp_samples = []
 
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(process_device_file, p): p for p in files}
@@ -238,7 +251,8 @@ def main():
                 result = future.result(timeout=300)
             except Exception as e:
                 result = {"path": path, "error": str(e), "device_summary": None,
-                          "bucket_rows": [], "batch_size_counts": {}}
+                          "bucket_rows": [], "batch_size_counts": {}, "n_images_raw": 0,
+                          "raw_timestamp_sample": [], "dropped_missing_timestamp": None}
 
             if result.get("error"):
                 errors.append((result["path"], result["error"]))
@@ -248,12 +262,45 @@ def main():
             bucket_rows_all.extend(result["bucket_rows"])
             for size, count in result["batch_size_counts"].items():
                 batch_size_counts_total[size] = batch_size_counts_total.get(size, 0) + count
+            total_images_raw += result.get("n_images_raw") or 0
+            total_dropped_missing_timestamp += result.get("dropped_missing_timestamp") or 0
+            if result.get("raw_timestamp_sample") and len(raw_timestamp_samples) < 5:
+                raw_timestamp_samples.append((result["path"], result["raw_timestamp_sample"]))
 
     print(f"\nDevices processed OK: {len(device_summaries):,}   errored: {len(errors):,}")
     if errors:
         print("Sample errors (up to 5):")
         for path, err in errors[:5]:
             print(f"  {path}: {err}")
+
+    print(f"\nTotal raw image rows read: {total_images_raw:,}")
+    print(f"Rows dropped for unparseable/missing timestamp: {total_dropped_missing_timestamp:,} "
+          f"({100 * total_dropped_missing_timestamp / total_images_raw:.1f}% of raw rows)"
+          if total_images_raw else "")
+
+    # Fail loud and diagnosable instead of an opaque KeyError deep inside
+    # pandas groupby/sort_values on an empty, columnless frame (what an older
+    # pandas build does when every device's timestamps failed to parse and
+    # bucket_rows_all ends up completely empty).
+    if not bucket_rows_all:
+        print("\n" + "!" * 78)
+        print("No arrivals/bucket rows were reconstructed from ANY processed file.")
+        if total_images_raw and total_dropped_missing_timestamp == total_images_raw:
+            print("Every single raw row's timestamp failed to parse (100% dropped) -")
+            print("this is almost certainly a timestamp format mismatch on this")
+            print("environment/dataset, not a real empty dataset. Raw (unparsed)")
+            print("timestamp samples from the affected files:")
+            for path, sample in raw_timestamp_samples:
+                print(f"  {path}: {sample}")
+            print("\nFix: adjust the pd.to_datetime(...) call in process_device_file")
+            print("(e.g. pass an explicit format= matching what's printed above),")
+            print("then re-run.")
+        else:
+            print("Raw row / dropped-row counts above didn't show a clear 100% drop -")
+            print("investigate per_device_summary (once any non-empty devices exist)")
+            print("or re-run with MAX_WORKERS=1 on one file to inspect directly.")
+        print("!" * 78)
+        raise SystemExit(1)
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
