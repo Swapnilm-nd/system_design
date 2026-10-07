@@ -316,6 +316,20 @@ def main():
     # carry device identity (aggregated fleet-wide below) - kept lightweight
     # on purpose; see per_device_summary.csv for the per-device view.
 
+    # Diagnostic instrumentation (temporary - remove once the "granularity"
+    # KeyError on this environment's pandas build is understood): the earlier
+    # "is bucket_rows_all empty" guard above did NOT fire, meaning this list
+    # is non-empty, yet the groupby/sort_values below has still failed to
+    # find a "granularity" column on this exact pandas/Python 3.6 build -
+    # print exactly what got constructed instead of guessing further.
+    print(f"\n[diag] bucket_rows_all length: {len(bucket_rows_all):,}")
+    print(f"[diag] bucket_rows_all[0]: {bucket_rows_all[0]!r}")
+    print(f"[diag] bucket_df.shape: {bucket_df.shape}")
+    print(f"[diag] bucket_df.columns: {bucket_df.columns.tolist()}")
+    print(f"[diag] bucket_df.dtypes:\n{bucket_df.dtypes}")
+    if not bucket_df.empty:
+        print(f"[diag] bucket_df.head(3):\n{bucket_df.head(3).to_string()}")
+
     # ---- 3. Fleet-wide (overall) per-bucket request/image counts - the
     # primary "frequency of incoming requests" output ----
     overall_bucket_df = (
